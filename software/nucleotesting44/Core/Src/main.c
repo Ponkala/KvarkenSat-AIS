@@ -31,6 +31,7 @@
 #define SHORT_MAX 32767
 #define FFT_SIZE 2048
 #define SAMPLERATE 312500
+#define DECIMATION_FACTOR 3
 
 #define SNR_THRESHOLD_F32    75.0f
 #define BLOCK_SIZE            64
@@ -38,9 +39,9 @@
 /* Must be a multiple of 16 */
 #define NUM_TAPS_ARRAY_SIZE              32
 #else
-#define NUM_TAPS_ARRAY_SIZE              63
+#define NUM_TAPS_ARRAY_SIZE              61
 #endif
-#define NUM_TAPS              63
+#define NUM_TAPS              60
 
 #include "math.h"
 #include "usbd_cdc_if.h"
@@ -114,8 +115,10 @@ UART_HandleTypeDef huart3;
 /* USER CODE BEGIN PV */
 ALIGN_32BYTES (static uint16_t   aADC1ConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]);
 ALIGN_32BYTES (static uint16_t   aADC3ConvertedData[ADC_CONVERTED_DATA_BUFFER_SIZE]);
-ALIGN_32BYTES (static uint16_t 	 adc1_data[ADC_CONVERTED_DATA_BUFFER_SIZE]); //I signal
-ALIGN_32BYTES (static uint16_t 	 adc3_data[ADC_CONVERTED_DATA_BUFFER_SIZE]); //Q signal
+ALIGN_32BYTES (static int16_t 	 adc1_data[ADC_CONVERTED_DATA_BUFFER_SIZE]); //I signal
+ALIGN_32BYTES (static int16_t 	 adc3_data[ADC_CONVERTED_DATA_BUFFER_SIZE]); //Q signal
+ALIGN_32BYTES (static int16_t 	 adc1_datafir[ADC_CONVERTED_DATA_BUFFER_SIZE]); //I signal
+ALIGN_32BYTES (static int16_t	 adc3_datafir[ADC_CONVERTED_DATA_BUFFER_SIZE]); //Q signal
 
 static struct receiver *rx_a = NULL;
 /* USER CODE END PV */
@@ -142,7 +145,7 @@ char *data = "Hello world\n"; //a must have
 
 char buffer[64];
 
-static float32_t testOutput[FFT_SIZE*2];
+static q31_t testOutput[FFT_SIZE*2];
 
 uint32_t fftSize = FFT_SIZE;
 uint32_t ifftFlag = 0;		// regular FFT
@@ -152,9 +155,10 @@ uint32_t refIndex = 213, testIndex = 0;
 
 //extern uint16_t mysine[1500]; //sine signal for testing
 
-extern uint32_t myAISIdac[1500]; //AIS I signal for dac channel 1
-extern uint32_t myAISQdac[1500]; //AIS Q signal for dac channel 2
-
+//extern uint32_t myAISIdac[1500]; //AIS I signal for dac channel 1
+//extern uint32_t myAISQdac[1500]; //AIS Q signal for dac channel 2
+extern uint32_t realdataI[3000]; //AIS I signal for dac channel 1
+extern uint32_t realdataQ[3000]; //AIS Q signal for dac channel 2
 /* extern uint16_t myAISI[1290];	//AIS signal for testing
    extern uint16_t myAISQ[1290];	//AIS signal for testing
 */
@@ -164,17 +168,31 @@ float64_t temp_Q = 0;
 static complex complex_data;
 static complex prev_complex;
 static complex temp_complex;
-static int16_t demodulated_IQ[2048];
+static int16_t demodulated_IQ[ADC_CONVERTED_DATA_BUFFER_SIZE];
 
 uint32_t prim;
-float32_t maxValue;
-
-
+q31_t maxValue;
 
 uint32_t blockSize = BLOCK_SIZE;
-uint32_t numBlocks = 0;
-
+uint32_t numBlocks = ADC_CONVERTED_DATA_BUFFER_SIZE/BLOCK_SIZE/2;
 float32_t  snr;
+
+//fir stuff
+
+extern q15_t firCoeff025[NUM_TAPS_ARRAY_SIZE];
+extern q15_t firCoeff001[NUM_TAPS_ARRAY_SIZE];
+extern q15_t firCoeffhighpass[NUM_TAPS_ARRAY_SIZE];
+
+static q15_t firState1[BLOCK_SIZE + NUM_TAPS - 0];
+static q15_t firState2[BLOCK_SIZE + NUM_TAPS - 0];
+static q15_t firState3[BLOCK_SIZE + NUM_TAPS - 0];
+
+
+arm_fir_instance_q15 firS;
+arm_fir_instance_q15 firS2;
+arm_fir_instance_q15 firS3;
+
+float32_t  *firInput, *firOutput;
 
 /* USER CODE END 0 */
 
@@ -223,20 +241,25 @@ int main(void)
   MX_USB_DEVICE_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  // start ADCs. Saves data to aADCxConvertedData
 
-
-  uint16_t startflag;
-  uint16_t endflag;
+  float32_t radians;
+  float32_t sineval;
   uint16_t startflag1;
   uint16_t endflag1;
-  uint16_t min_val;
-  uint16_t max_val;
+  int16_t meanvalue1;
+  int16_t meanvalue3;
+  int16_t temporary_value = 3000;
+  int16_t decimate;
+  int32_t mix_freq;
+  rx_a = init_receiver('A', 1, 0, 0); // initialize receiver
 
-  rx_a = init_receiver('A', 1, 0, 0);	// PLL
   char stringBuf[100];
-  float32_t data_Buffer[FFT_SIZE*2] = {0};
+  q31_t data_Buffer[FFT_SIZE*2] = {0};
+  arm_fir_init_q15(&firS, NUM_TAPS, firCoeff025, firState1, blockSize);
+  arm_fir_init_q15(&firS2, NUM_TAPS, firCoeff001, firState2, blockSize);
+  arm_fir_init_q15(&firS3, NUM_TAPS, firCoeffhighpass, firState3, blockSize);
 
+  // start ADCs. Saves data to aADCxConvertedData
 
 
 	  if (HAL_ADC_Start_DMA(&hadc1,
@@ -264,8 +287,8 @@ int main(void)
 			  	  	    DAC_CHANNEL_2,
 						    //(uint32_t *)aADCxConvertedData,
 							//ADC_CONVERTED_DATA_BUFFER_SIZE/2,
-							(uint32_t *)myAISQdac,
-							1500,
+							(uint32_t *)realdataI,
+							6000,
 							DAC_ALIGN_12B_R)
 			  	  	    != HAL_OK)
 	  {
@@ -275,8 +298,8 @@ int main(void)
 			  	  	    DAC_CHANNEL_1,
 						    //(uint32_t *)aADCxConvertedData,
 							//ADC_CONVERTED_DATA_BUFFER_SIZE/2,
-							(uint32_t *)myAISIdac,
-							1500,
+							(uint32_t *)realdataQ,
+							6000,
 							DAC_ALIGN_12B_R)
 			  	  	    != HAL_OK)
 	  {
@@ -296,98 +319,143 @@ int main(void)
     /* USER CODE BEGIN 3 */
 
 	  memset(stringBuf, '\0', 100);
-	  memset(data_Buffer, 0, FFT_SIZE*sizeof(float32_t)*2);
-	  memset(testOutput, 0, FFT_SIZE*sizeof(float32_t)*2);
+	  memset(data_Buffer, 0, FFT_SIZE*sizeof(q31_t)*2);
+	  memset(testOutput, 0, FFT_SIZE*sizeof(q31_t)*2);
 	  prev_complex = 0;
 	  complex_data = 0;
 	  temp_complex = 0;
 	  temp_I = 0;
 	  temp_Q = 0;
-	  startflag = 0;
-	  endflag   = 0;
-	  startflag1 = 0;
-	  endflag1 = 0;
-	  min_val = 0;
-	  max_val = 0xffff;
-
-
-	  // memcpy(adc1_data, aADC1ConvertedData, 2048*4);
-	  // memcpy(adc3_data, aADC3ConvertedData, 2048*4);
-
+	  startflag1 = 150;
+	  endflag1 = 3000;
+	  meanvalue1 = 0;
+	  meanvalue3 = 0;
+	  mix_freq = 0;
 	  prim = __get_PRIMASK();
 	  __disable_irq();
 
-
-	  // finds signal start and end, TODO: make more universal
-	  for(uint16_t i = 1; i<ADC_CONVERTED_DATA_BUFFER_SIZE; i++){
-
-		  if(adc1_data[i]> max_val){
-			  max_val = adc1_data[i];
-		  }else if(adc1_data[i]<min_val){
-			  min_val = adc1_data[i];
-		  }
-
-		  if(startflag1 == 0 && endflag1 == 0){
-			  if(adc3_data[i]<UINT16_OFFSET+400 && adc3_data[i]>UINT16_OFFSET-400){
-				  startflag++;
-			  }else if(startflag>5){
-				  startflag1 = i-100; //startflag finalized here
-				  endflag1 = 0;
-				  endflag = 0;
-			  }else{
-				  startflag = 0;
-			  }
-		  }
-		  if(startflag1 != 0 && endflag1 == 0){
-		  	  if(endflag >5){
-				  endflag1 = i-6; //endflag finalized here
-			  }else if(adc3_data[i]<UINT16_OFFSET+400 && adc3_data[i]>UINT16_OFFSET-400){
-				  endflag++;
-			  }else{
-				  endflag = 0;
-			  }
-		  }
-		  if(endflag1-startflag1 >= 2048){
-			  endflag1 = 0;
-			  startflag1 = 0;
-		  }
-	  }
-	  int j = 0;
-	  for(int i = startflag1; i < endflag1; i++){
-
-		  data_Buffer[j] = (float32_t)(adc1_data[i] - UINT16_OFFSET )/(UINT16_OFFSET);
-		  j++;
-		  data_Buffer[j] = (float32_t)(adc3_data[i] - UINT16_OFFSET )/(UINT16_OFFSET);
-		  j++;
-
-	  }
-	  j = 0;
+	  // cast uint16->int16
 
 	  for(uint16_t i = 1; i<ADC_CONVERTED_DATA_BUFFER_SIZE; i++){
-		  arm_cfft_f32(&arm_cfft_sR_f32_len2048, data_Buffer, ifftFlag, doBitReverse);
-		  arm_cmplx_mag_f32(data_Buffer, testOutput, FFT_SIZE);
-		  arm_max_f32(testOutput, fftSize, &maxValue, &testIndex);
+		  adc1_data[i] = swap_bytes(adc1_data[i]);
+		  //adc1_data[i] = (realdataI[i] - 2048) * 16;
+		  //adc1_data[i] = realdataI[i];
+		  //adc3_data[i] = realdataQ[i];
+		  adc3_data[i] = swap_bytes(adc3_data[i]);
+		  //adc3_data[i] = (realdataQ[i] - 2048) * 16;
 	  }
-	  // demodulate signal, saved to demodulated_IQ
-	  gmsk_demod(startflag1, endflag1, demodulated_IQ);
+	  //remove zero spike
+
+	  arm_mean_q15 (adc1_data, ADC_CONVERTED_DATA_BUFFER_SIZE, &meanvalue1);
+	  //arm_mean_q15 (adc1_data, temporary_value, &meanvalue1);
+	  arm_mean_q15 (adc3_data, ADC_CONVERTED_DATA_BUFFER_SIZE, &meanvalue3);
+	  //arm_mean_q15 (adc3_data, temporary_value, &meanvalue3);
+
+	  //for(uint16_t i =0;i<temporary_value;i++){
+	  for(uint16_t i =0; i< ADC_CONVERTED_DATA_BUFFER_SIZE; i++){
+			  adc1_data[i] -= meanvalue1;
+			  adc1_data[i] *= 16; //multiply with arbitrary value
+			  adc3_data[i] -= meanvalue3;
+			  adc3_data[i] *= 16;
+	  }
+
+
+	  // find peak frequency
+	  for(uint16_t i = 0; i<ADC_CONVERTED_DATA_BUFFER_SIZE; i+=FFT_SIZE*2){
+		  //for(uint16_t i = 0; i<temporary_value; i+=FFT_SIZE*2){
+
+		  //save data to buffer, use 32bit values shifted left 16 bits because that helps.
+		  for(uint16_t j = 0; j < FFT_SIZE*2; j++){
+			  data_Buffer[j] = (adc1_data[i+j]<<16);// - UINT16_OFFSET )/(UINT16_OFFSET);
+			  j++;
+			  data_Buffer[j] = (adc3_data[i+j]<<16); //data_Buffer[j] = (adc3_data[i+j]<<16);// - UINT16_OFFSET )/(UINT16_OFFSET);
+		  }
+
+		  //fft from buffered data
+		  arm_cfft_q31(&arm_cfft_sR_q31_len2048, data_Buffer, ifftFlag, doBitReverse);
+		  arm_cmplx_mag_q31(data_Buffer, testOutput, FFT_SIZE);
+
+		  //max value and index of said max value
+		  arm_max_q31(testOutput, fftSize, &maxValue, &testIndex);
+
+		  //calculate peak freq
+		  if(testIndex > FFT_SIZE/2){ //on right plane ->  get negative value
+			  mix_freq = (int32_t)(testIndex * ((SAMPLERATE/2) / FFT_SIZE) % (SAMPLERATE/2)) - SAMPLERATE/2;
+		  }else{ //on left plane
+			  mix_freq = testIndex * (SAMPLERATE/2) / FFT_SIZE;
+		  }
+
+
+		  //peak expected around 25 kHz, check if mix_freq has valid value.
+		  if((mix_freq < 90000 && mix_freq >20000 ) || (mix_freq >-90000 && mix_freq < -20000)){
+			  break;
+		  }else{
+			  mix_freq = 0;
+			  memset(testOutput, 0, FFT_SIZE*sizeof(q31_t)*2);
+		  }
+	  }
+	  //downmixing
+
+	  if(mix_freq != 0){
+
+		  //smix_freq=-54253;
+	    for(uint16_t i = 0; i<ADC_CONVERTED_DATA_BUFFER_SIZE; i++){
+			  radians = ((mix_freq/((float32_t)SAMPLERATE)) *2*M_PI*i);
+			  sineval = arm_sin_f32(radians); 		//move to positive values only
+			  adc1_data[i] =(adc1_data[i])*sineval; //adc1_data[i] =(adc1_data[i])*sineval; //-UINT16_OFFSET)*sineval + UINT16_OFFSET;
+			  adc3_data[i] =(adc3_data[i])*sineval; //adc3_data[i] =(adc3_data[i])*sineval; //-UINT16_OFFSET)*sineval + UINT16_OFFSET;
+		  }
+	  }
+	  //lowpass
+	  for(int i=0; i < numBlocks; i++)
+	  {
+		  arm_fir_q15(&firS, adc1_data+i*blockSize, adc1_datafir+i*blockSize, blockSize);//arm_fir_q15(&firS, adc1_data+i*blockSize, adc1_datafir+i*blockSize, blockSize);
+	  }
+	  for(int i=0; i < numBlocks; i++)
+	  {
+		  arm_fir_q15(&firS, adc3_data+i*blockSize, adc3_datafir+i*blockSize, blockSize);//arm_fir_q15(&firS, adc3_data+i*blockSize, adc3_datafir+i*blockSize, blockSize);
+	  }
+
+
+	  // demodulate signal in adc1_datafir and adc3_datafir, saved to demodulated_IQ
+	  gmsk_demod(0, ADC_CONVERTED_DATA_BUFFER_SIZE, demodulated_IQ);
+	  // gmsk_demod(0, temporary_value, demodulated_IQ);
+	  // last filtering with 0.1 lowpass
+	  for(int i=0; i < numBlocks; i++){
+		  arm_fir_q15(&firS2, demodulated_IQ+i*blockSize, adc1_data+i*blockSize, blockSize);
+	  }
 
 	  demodulated_IQ[0]=0;
 
-	  receiver_run(rx_a, demodulated_IQ, endflag1-startflag1);
+	  // get better data with log function
+	  /*for(int i = 0; i<ADC_CONVERTED_DATA_BUFFER_SIZE; i++){
+	  // for(int i = 0; i<temporary_value; i++){
+		  	  if(adc1_data[i]<0){
+				  adc1_data[i] = -1*log(abs(adc1_data[i])-1)*500;
+		  	  }else{
+				  adc1_data[i] = log(abs(adc1_data[i])-1)*500;
+		  	  }
 
-	  j = 0;
+	  }*/
+	  for(int i = 0; i<ADC_CONVERTED_DATA_BUFFER_SIZE/DECIMATION_FACTOR; i++){
+		      adc1_data[i]=adc1_data[i*DECIMATION_FACTOR];
+	  }
+	  //receiver_run(rx_a, adc1_data, temporary_value);
+	  for(int i = 0; i<ADC_CONVERTED_DATA_BUFFER_SIZE/DECIMATION_FACTOR; i+=1000){
+		  	  receiver_run(rx_a, adc1_data+i*sizeof(int16_t), 1000);
+	  }
+	  //receiver_run(rx_a, adc1_data, 3000);
+
+
+
 
 	  // from example arm_fft_bin.example.c:
 	  /* Process the data through the CFFT/CIFFT module */
-	  arm_cfft_f32(&arm_cfft_sR_f32_len2048, data_Buffer, ifftFlag, doBitReverse);
+	  /*arm_cfft_f32(&arm_cfft_sR_f32_len2048, data_Buffer, ifftFlag, doBitReverse);
 	  arm_cmplx_mag_f32(data_Buffer, testOutput, FFT_SIZE);
-	  arm_max_f32(testOutput, fftSize, &maxValue, &testIndex);
+	  arm_max_f32(testOutput, fftSize, &maxValue, &testIndex);*/
 
 	  //arm_rfft_fast_f32(&instance, data_Buffer, testOutput, 0);
-
-	  /* Process the data through the Complex Magnitude Module for
-		 calculating the magnitude at each bin */
-	  //arm_cmplx_mag_f32(data_Buffer, testOutput, fftSize);
 
 	  // MATLAB compatible data transfer. Transfer as characters, MATLAB reads as correct data length.:
 	  data = "flag data:\n";
@@ -396,60 +464,65 @@ int main(void)
 	  HAL_UART_Transmit(&huart3,  (uint8_t *)stringBuf, strlen(stringBuf), HAL_MAX_DELAY);
 	  sprintf(stringBuf, "%d\n", endflag1 );
 	  HAL_UART_Transmit(&huart3,  (uint8_t *)stringBuf, strlen(stringBuf), HAL_MAX_DELAY);
-	  data = "flag data end:\n";
+      data = "flag data end:\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
 
 
 
-	  data = "demod data:\n";
+      data = "demod data:\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
 
 	  //HAL_UART_Transmit(&huart3, (uint8_t *) demodulated_IQ,
 	  	//		  	  1290*2, HAL_MAX_DELAY);
-	  HAL_UART_Transmit(&huart3, (uint8_t *) demodulated_IQ,
-			  	  (endflag1-startflag1)*2, HAL_MAX_DELAY);
+	  HAL_UART_Transmit(&huart3, (uint8_t *) adc1_data,
+			  (ADC_CONVERTED_DATA_BUFFER_SIZE)/DECIMATION_FACTOR, HAL_MAX_DELAY);
 
 	  data = "demod data end:\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
 
 	  //transmit NMEA
-	  sprintf(stringBuf, "rx_a PLL decoded data in NMEA format: %s \n", rx_a->decoder->nmea );
+	  sprintf(stringBuf, "freq: %ld, pre: %ld, start: %ld, rx_a PLL decoded data in NMEA format: %s \n",
+			  mix_freq, rx_a->decoder->npreamble,rx_a->decoder->startsample,rx_a->decoder->nmea );
 	  HAL_UART_Transmit(&huart3, (uint8_t *)stringBuf, strlen(stringBuf), HAL_MAX_DELAY);
 
 	  //transmit FFT
-	  data = "FFT data:\n";
+	  /*data = "FFT data:\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
 
 	  HAL_UART_Transmit(&huart3, (uint8_t *) testOutput,
-			  	  	  	  FFT_SIZE*4, HAL_MAX_DELAY);
+			  	  	  	  FFT_SIZE*sizeof(q31_t), HAL_MAX_DELAY);
 
 	  data = "FFT data end.\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
-
+*/
 	  //Transfer ADC data:
-
+/*
 	  data = "ADC1 data:\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
 
-	  HAL_UART_Transmit(&huart3, (uint8_t *) adc1_data+(startflag1*2),
-			  (endflag1-startflag1)*2, HAL_MAX_DELAY);
+	  HAL_UART_Transmit(&huart3, (uint8_t *) adc1_datafir,
+			  (ADC_CONVERTED_DATA_BUFFER_SIZE)/2, HAL_MAX_DELAY);
 	  data = "ADC1 data end.\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
 
 	  data = "ADC3 data:\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
 
-	  HAL_UART_Transmit(&huart3, (uint8_t *) adc3_data+(startflag1*2),
-			  (endflag1-startflag1)*2, HAL_MAX_DELAY);
+	  HAL_UART_Transmit(&huart3, (uint8_t *) adc3_datafir,
+			  (ADC_CONVERTED_DATA_BUFFER_SIZE)/2, HAL_MAX_DELAY);
 	  data = "ADC3 data end.\n";
 	  HAL_UART_Transmit(&huart3, (uint8_t *)data, strlen(data), HAL_MAX_DELAY);
-
+*/
 	  //delay because why not
 	  //HAL_Delay(1000);
+	  memset(demodulated_IQ, 0, ADC_CONVERTED_DATA_BUFFER_SIZE*sizeof(int16_t));
+
+	  memset(rx_a->decoder->nmea, '\0', NMEABUFFER_LEN);
+	  memset(&(rx_a->decoder->nstartsign), 0, sizeof(rx_a->decoder->nstartsign));
+	  memset(&(rx_a->decoder->npreamble), 0, sizeof(rx_a->decoder->npreamble));
+	  memset(&(rx_a->decoder->startsample), 0, sizeof(rx_a->decoder->startsample));
 	  __enable_irq();
 
-	  memset(demodulated_IQ, 0, 2048*sizeof(int16_t));
-	  memset(rx_a->decoder->nmea, '\0', NMEABUFFER_LEN);
 
   }
   /* USER CODE END 3 */
@@ -996,8 +1069,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
 	prim = __get_PRIMASK();
 	__disable_irq();
 	if(hadc == &hadc1){
-		memcpy(adc1_data+ADC_CONVERTED_DATA_BUFFER_SIZE/2, aADC1ConvertedData+ADC_CONVERTED_DATA_BUFFER_SIZE/2, ADC_CONVERTED_DATA_BUFFER_SIZE);
-	    memcpy(adc3_data+ADC_CONVERTED_DATA_BUFFER_SIZE/2, aADC3ConvertedData+ADC_CONVERTED_DATA_BUFFER_SIZE/2, ADC_CONVERTED_DATA_BUFFER_SIZE);
+		memcpy(adc1_data+ADC_CONVERTED_DATA_BUFFER_SIZE/2, aADC1ConvertedData+ADC_CONVERTED_DATA_BUFFER_SIZE/2, sizeof(uint16_t)*ADC_CONVERTED_DATA_BUFFER_SIZE/2);
+	    memcpy(adc3_data+ADC_CONVERTED_DATA_BUFFER_SIZE/2, aADC3ConvertedData+ADC_CONVERTED_DATA_BUFFER_SIZE/2, sizeof(uint16_t)*ADC_CONVERTED_DATA_BUFFER_SIZE/2);
 	    //memcpy(adc1_data, aADC1ConvertedData, 2048*4);
 	    //memcpy(adc3_data, aADC3ConvertedData, 2048*4);
 
@@ -1010,13 +1083,17 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
 }
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc){
 	prim = __get_PRIMASK();
-	  if(hadc == &hadc1){
-		  memcpy(adc1_data, aADC1ConvertedData, ADC_CONVERTED_DATA_BUFFER_SIZE);
-		  memcpy(adc3_data, aADC3ConvertedData, ADC_CONVERTED_DATA_BUFFER_SIZE);
-	  }
-		if(!prim){
-			__enable_irq();
-		}
+	__disable_irq();
+
+
+	if(hadc == &hadc1){
+	  memcpy(adc1_data, aADC1ConvertedData, sizeof(uint16_t)*ADC_CONVERTED_DATA_BUFFER_SIZE/2);
+	  memcpy(adc3_data, aADC3ConvertedData, sizeof(uint16_t)*ADC_CONVERTED_DATA_BUFFER_SIZE/2);
+	}
+
+	if(!prim){
+		__enable_irq();
+	}
 }
 /* Demodulates gmsk modulated signal that has been downmixed
  * startflag = signal start in adcx_data
@@ -1030,8 +1107,8 @@ void gmsk_demod(int startflag, int endflag, int16_t *demodulated_IQ){
 		/*temp_I = -(float64_t)(adc1_data[i] - (max_val-min_val)/2) / ((max_val-min_val)/2);// cast uint16 value to float64_t
 		temp_Q = -(float64_t)(adc3_data[i] - (max_val-min_val)/2) / ((max_val-min_val)/2);*/
 
-		temp_I = -(float64_t)(adc1_data[i] - (UINT16_OFFSET)) / (UINT16_OFFSET);// cast uint16 value to float64_t
-		temp_Q = -(float64_t)(adc3_data[i] - (UINT16_OFFSET)) / (UINT16_OFFSET);
+		temp_I = -(float64_t)(adc1_datafir[i]) / UINT16_OFFSET;// (UINT16_OFFSET);// cast int16 value to float64_t
+		temp_Q = -(float64_t)(adc3_datafir[i]) / UINT16_OFFSET;// (UINT16_OFFSET);
 
 		complex_data = (temp_I + (temp_Q * _Complex_I));
 		temp_complex = complex_data * conj(prev_complex); // polar discriminator
@@ -1039,7 +1116,10 @@ void gmsk_demod(int startflag, int endflag, int16_t *demodulated_IQ){
 		prev_complex = complex_data;
 
 	}
-
+}
+int16_t swap_bytes(int16_t data){
+	data = data+UINT16_OFFSET;
+	return data;
 }
 /* USER CODE END 4 */
 

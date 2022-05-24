@@ -55,6 +55,7 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 void gmsk_demod(int startflag, int endflag, int16_t *demodulated_IQ);
+int16_t swap_bytes(int16_t data);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
